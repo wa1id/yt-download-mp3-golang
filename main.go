@@ -2,13 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 type errorResponse struct {
 	Error string `json:"error"`
@@ -58,15 +59,49 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filename := sanitizeFilename(title) + ".mp3"
+
+	// Start the stream in a background goroutine writing into a pipe.
+	// We read the first chunk before committing HTTP headers — this lets us
+	// return a proper JSON error if the download fails before producing any audio,
+	// instead of sending a 200 OK with an empty body.
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		err := streamMP3(req.URL, pw)
+		pw.CloseWithError(err)
+		errCh <- err
+	}()
+
+	// Peek: try to read the first chunk from the pipe.
+	firstChunk := make([]byte, 4096)
+	n, _ := pr.Read(firstChunk)
+
+	if n == 0 {
+		// No bytes arrived — the download failed before producing any audio.
+		// Drain the error from the goroutine and surface it to the caller.
+		pr.Close()
+		streamErr := <-errCh
+		msg := "download produced no output"
+		if streamErr != nil {
+			msg = streamErr.Error()
+		}
+		log.Printf("download failed for %s: %v", req.URL, streamErr)
+		writeError(w, http.StatusInternalServerError, msg, req.URL)
+		return
+	}
+
+	// Data is flowing — safe to commit response headers now.
 	w.Header().Set("Content-Type", "audio/mpeg")
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	if err := streamMP3(req.URL, w); err != nil {
-		// Headers already sent, we can't change the status code at this point.
-		// Log the error so it's visible in Portainer logs.
-		log.Printf("stream error for %s: %v", req.URL, err)
+	// Write the already-buffered chunk, then stream the rest.
+	if _, err := w.Write(firstChunk[:n]); err != nil {
+		log.Printf("write error for %s: %v", req.URL, err)
 		return
+	}
+	if _, err := io.Copy(w, pr); err != nil {
+		log.Printf("stream copy error for %s: %v", req.URL, err)
 	}
 
 	log.Printf("download complete: %s", filename)
