@@ -62,7 +62,7 @@ func streamMP3(url string, w io.Writer) error {
 	// We skip -x so yt-dlp does not invoke its own ffmpeg post-processor.
 	ytdlp := exec.CommandContext(ctx, "yt-dlp",
 		"--no-playlist",
-		"-f", "bestaudio",
+		"-f", "bestaudio/best",
 		"--no-warnings",
 		"-o", "-",
 		url,
