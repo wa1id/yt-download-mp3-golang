@@ -37,43 +37,79 @@ func fetchTitle(url string) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-// streamMP3 invokes yt-dlp to download audio and transcode it to MP3 via
-// ffmpeg, streaming the result directly to w. No temporary files are written.
+// streamMP3 downloads the best audio stream via yt-dlp and pipes it through a
+// dedicated ffmpeg process for transcoding. No temporary files are written.
 //
-// Audio is optimised for OpenAI Whisper:
-//   - 32 kbps CBR  — at 32 kbps a 100-minute video fits within Whisper's 25 MB limit
-//   - Mono         — Whisper is single-channel; stereo doubles size for no benefit
-//   - 16 kHz       — Whisper's native sample rate; higher rates are downsampled anyway
+// Two-process pipeline:
 //
-// yt-dlp flags used:
+//	yt-dlp  →  raw audio container (webm/opus or m4a/aac)  →  ffmpeg  →  MP3  →  w
 //
-//	-x                           extract audio only
-//	--audio-format mp3           transcode to MP3 via ffmpeg
-//	--audio-quality 32K          32 kbps CBR (keeps files well under 25 MB)
-//	--postprocessor-args         pass extra ffmpeg flags: mono (-ac 1) + 16 kHz (-ar 16000)
-//	-o -                         write output to stdout
-//	--no-playlist                never download a playlist, only the single video
+// Running ffmpeg ourselves (rather than relying on yt-dlp's post-processor)
+// guarantees the bitrate and channel settings are applied correctly when
+// streaming to stdout, which yt-dlp's internal post-processor does not reliably
+// handle with -o -.
+//
+// Audio is optimised for OpenAI Whisper (25 MB file size limit):
+//
+//	-ac 1      mono   — Whisper is single-channel; stereo doubles size for no gain
+//	-ar 16000  16 kHz — Whisper's native sample rate
+//	-b:a 32k   32 kbps CBR — ~2.4 MB per 10 min; 100-min video ≈ 24 MB
 func streamMP3(url string, w io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "yt-dlp",
+	// yt-dlp: select best audio-only format, write raw container to stdout.
+	// We skip -x so yt-dlp does not invoke its own ffmpeg post-processor.
+	ytdlp := exec.CommandContext(ctx, "yt-dlp",
 		"--no-playlist",
-		"-x",
-		"--audio-format", "mp3",
-		"--audio-quality", "32K",
-		"--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
+		"-f", "bestaudio",
 		"--no-warnings",
 		"-o", "-",
 		url,
 	)
 
-	var stderr bytes.Buffer
-	cmd.Stdout = w
-	cmd.Stderr = &stderr
+	// ffmpeg: read raw audio from stdin, transcode to MP3 with Whisper settings.
+	ffmpeg := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-i", "pipe:0",
+		"-ac", "1",
+		"-ar", "16000",
+		"-b:a", "32k",
+		"-f", "mp3",
+		"pipe:1",
+	)
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("yt-dlp stream failed: %w — stderr: %s", err, stderr.String())
+	// Wire: yt-dlp stdout → ffmpeg stdin → w
+	pr, pw := io.Pipe()
+	ytdlp.Stdout = pw
+	ffmpeg.Stdin = pr
+	ffmpeg.Stdout = w
+
+	var ytdlpStderr, ffmpegStderr bytes.Buffer
+	ytdlp.Stderr = &ytdlpStderr
+	ffmpeg.Stderr = &ffmpegStderr
+
+	if err := ytdlp.Start(); err != nil {
+		return fmt.Errorf("could not start yt-dlp: %w", err)
+	}
+	if err := ffmpeg.Start(); err != nil {
+		ytdlp.Process.Kill()
+		return fmt.Errorf("could not start ffmpeg: %w", err)
+	}
+
+	// Wait for yt-dlp; closing pw with its error (or nil) signals EOF/error to
+	// ffmpeg's stdin, allowing ffmpeg to flush and exit cleanly.
+	ytdlpErr := ytdlp.Wait()
+	pw.CloseWithError(ytdlpErr)
+
+	ffmpegErr := ffmpeg.Wait()
+
+	if ytdlpErr != nil {
+		return fmt.Errorf("yt-dlp failed: %w — stderr: %s", ytdlpErr, ytdlpStderr.String())
+	}
+	if ffmpegErr != nil {
+		return fmt.Errorf("ffmpeg failed: %w — stderr: %s", ffmpegErr, ffmpegStderr.String())
 	}
 
 	return nil
