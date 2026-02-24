@@ -9,7 +9,7 @@ set -euo pipefail
 
 CONTAINER_NAME="yt-downloader"
 IMAGE_NAME="yt-download-mp3"
-NETWORK="${1:-apps-net}"
+NETWORK="${1:-web}"
 PORT="8080"
 
 echo "==> Pulling latest code..."
