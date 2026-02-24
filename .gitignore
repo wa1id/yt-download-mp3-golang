@@ -1,0 +1,13 @@
+# compiled binaries
+yt-download-mp3
+yt-download-mp3-golang
+
+# environment files
+.env
+.env.*
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
