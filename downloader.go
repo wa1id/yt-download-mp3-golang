@@ -40,13 +40,19 @@ func fetchTitle(url string) (string, error) {
 // streamMP3 invokes yt-dlp to download audio and transcode it to MP3 via
 // ffmpeg, streaming the result directly to w. No temporary files are written.
 //
+// Audio is optimised for OpenAI Whisper:
+//   - 32 kbps CBR  — at 32 kbps a 100-minute video fits within Whisper's 25 MB limit
+//   - Mono         — Whisper is single-channel; stereo doubles size for no benefit
+//   - 16 kHz       — Whisper's native sample rate; higher rates are downsampled anyway
+//
 // yt-dlp flags used:
 //
-//	-x                  extract audio only
-//	--audio-format mp3  transcode to MP3 via ffmpeg
-//	--audio-quality 0   best quality (VBR)
-//	-o -                write output to stdout
-//	--no-playlist       never download a playlist, only the single video
+//	-x                           extract audio only
+//	--audio-format mp3           transcode to MP3 via ffmpeg
+//	--audio-quality 32K          32 kbps CBR (keeps files well under 25 MB)
+//	--postprocessor-args         pass extra ffmpeg flags: mono (-ac 1) + 16 kHz (-ar 16000)
+//	-o -                         write output to stdout
+//	--no-playlist                never download a playlist, only the single video
 func streamMP3(url string, w io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -55,7 +61,8 @@ func streamMP3(url string, w io.Writer) error {
 		"--no-playlist",
 		"-x",
 		"--audio-format", "mp3",
-		"--audio-quality", "0",
+		"--audio-quality", "32K",
+		"--postprocessor-args", "ffmpeg:-ac 1 -ar 16000",
 		"--no-warnings",
 		"-o", "-",
 		url,
